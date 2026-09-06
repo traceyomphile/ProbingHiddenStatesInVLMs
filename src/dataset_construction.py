@@ -149,7 +149,7 @@ def build_question_set(coco: COCOSubset, image_ids: list[int], cooccurrence: dic
     return question_set
 
     
-def save_manifest(questions: list[dict], path: str | Path) -> None:
+def save_manifest(questions: list[dict], path: str) -> None:
     """Saves the question set to a file at the specified path."""
     # Define acceptable file extensions
     acceptable_extensions = {'.json', '.jsonl', '.csv'}
@@ -175,7 +175,7 @@ def save_manifest(questions: list[dict], path: str | Path) -> None:
         df.to_csv(path, index=False)
     
 
-def load_manifest(path: str | Path) -> list[dict]:
+def load_manifest(path: str) -> list[dict]:
     """Loads the question set from a file at the specified path."""
     if not isinstance(path, Path):
         path = Path(path)
