@@ -40,7 +40,7 @@ def test_validness_of_ground_truth(manifest_df: pd.DataFrame, coco_subset: COCOS
         ground_truth = row['ground_truth']
 
         # Get the category ID for the given category name
-        category_id = coco_subset.get_category_id(category)[0]
+        category_id = coco_subset.get_category_id(category)
 
         # Get the annotation IDs for the given image and category
         ann_ids = coco_subset.get_annotation_ids(image_id, category_id)
@@ -74,7 +74,7 @@ def test_adversarial_absent_categories(manifest_df: pd.DataFrame, coco_subset: C
         category = row['category']
 
         # Get the category ID for the given category name
-        category_id = coco_subset.get_category_id(category)[0]
+        category_id = coco_subset.get_category_id(category)
 
         # Get the annotation IDs for the given image and category
         ann_ids = coco_subset.get_annotation_ids(image_id, category_id)
