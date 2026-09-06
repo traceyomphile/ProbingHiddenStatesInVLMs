@@ -5,8 +5,6 @@ import pandas as pd
 from itertools import combinations
 from collections import Counter
 from pathlib import Path
-from pycocotools.coco import COCO
-
 from src.COCOSubset import COCOSubset
 
 # PART A 
@@ -77,7 +75,7 @@ def build_question_set(coco: COCOSubset, image_ids: list[int], cooccurrence: dic
             question_set.append({
                 "image_id": image_id,
                 "category": present_category,
-                "question": f"Is there a '{present_category}' in this image? Answer yes or no.",
+                "question": f"Is there a {present_category} in this image? Answer yes or no.",
                 "question_type": "present",
                 "ground_truth": True
             })
@@ -89,13 +87,15 @@ def build_question_set(coco: COCOSubset, image_ids: list[int], cooccurrence: dic
             question_set.append({
                 "image_id": image_id,
                 "category": absent_random_category,
-                "question": f"Is there a '{absent_random_category}' in this image? Answer yes or no.",
+                "question": f"Is there a {absent_random_category} in this image? Answer yes or no.",
                 "question_type": "absent_random",
                 "ground_truth": False
             })
 
         # For absent_adversarial, select an absent category that has high co-occurrence with a present category
         if present_categories and absent_categories:
+            absent_categories.remove(absent_random_category)  # Ensure we don't pick the same category as absent_random
+
             cooccurring_absent = [
                 cat for cat in absent_categories 
                 if any((present_cat, cat) in cooccurrence or (cat, present_cat) in cooccurrence for present_cat in present_categories)
@@ -114,7 +114,7 @@ def build_question_set(coco: COCOSubset, image_ids: list[int], cooccurrence: dic
                 question_set.append({
                     "image_id": image_id,
                     "category": absent_adversarial_category,
-                    "question": f"Is there a '{absent_adversarial_category}' in this image? Answer yes or no.",
+                    "question": f"Is there a {absent_adversarial_category} in this image? Answer yes or no.",
                     "question_type": "absent_adversarial",
                     "ground_truth": False
                 })
