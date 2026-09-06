@@ -29,21 +29,18 @@ def compute_cooccurrence(coco: COCOSubset) -> dict[tuple[str, str], int]:
     """
     Symmetric pairwise category co-occurrence counts across every image in coco.
     """
-    # Get all category names
-    category_names = coco.get_category_names()
-
-    # Generate combinations of category pairs
-    category_pairs = combinations(category_names, 2)
-
     # Initialize co-occurrence counter
     cooccurrence = Counter()
 
     # Count co-occurrences across all images
     for image_id in coco.get_image_ids():
         present_categories = coco.get_present_categories(image_id)
-        for cat1, cat2 in category_pairs:
-            if cat1 in present_categories and cat2 in present_categories:
-                cooccurrence[(cat1, cat2)] += 1
+        combinations_of_categories = combinations(sorted(present_categories), 2)
+        for pair in combinations_of_categories:
+            if pair in cooccurrence:
+                cooccurrence[pair] += 1
+            else:
+                cooccurrence[pair] = 1
 
     return dict(cooccurrence)
 
@@ -126,7 +123,14 @@ def build_question_set(coco: COCOSubset, image_ids: list[int], cooccurrence: dic
             ]
             if cooccurring_absent:
                 # Choose the absent adversarial category with the highest co-occurrence count
-                absent_adversarial_category = max(cooccurring_absent, key=lambda cat: max(cooccurrence.get((present_cat, cat), 0) for present_cat in present_categories))
+                absent_adversarial_category = max(
+                    cooccurring_absent, 
+                    key=lambda cat: max(
+                        (max(cooccurrence.get((present_cat, cat), 0), cooccurrence.get((cat, present_cat), 0)) 
+                         for present_cat in present_categories),
+                         default=0
+                        ),
+                )
 
                 # Check if absent_adversarial_category starts with a vowel for question phrasing
                 if absent_adversarial_category[0].lower() in vowels:
@@ -150,32 +154,16 @@ def build_question_set(coco: COCOSubset, image_ids: list[int], cooccurrence: dic
 
     
 def save_manifest(questions: list[dict], path: str) -> None:
-    """Saves the question set to a file at the specified path."""
-    # Define acceptable file extensions
-    acceptable_extensions = {'.json', '.jsonl', '.csv'}
+    """Saves the question set to a csv file at the specified path."""
     if not isinstance(path, Path):
         path = Path(path)
-    if path.suffix not in acceptable_extensions:
-        raise ValueError("Unsupported file extension. Please use .json, .jsonl, or .csv.")
 
     # Create directory if it doesn't exist
     path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # If the file extension is .json, save as a JSON file
-    if path.suffix == '.json':
-        with open(path, 'w') as f:
-            json.dump(questions, f, indent=4)
 
-    # If the file extension is .jsonl, save as a JSON Lines file
-    elif path.suffix == '.jsonl':
-        with open(path, 'w') as f:
-            for question in questions:
-                f.write(json.dumps(question) + '\n')
-
-    # If the file extension is .csv, save as a CSV file
-    elif path.suffix == '.csv':
-        df = pd.DataFrame(questions)
-        df.to_csv(path, index=False)
+    # Save as a CSV file
+    df = pd.DataFrame(questions)
+    df.to_csv(path, index=False)
     
 
 def load_manifest(path: str) -> list[dict]:
@@ -185,24 +173,8 @@ def load_manifest(path: str) -> list[dict]:
     if not path.exists():
         raise FileNotFoundError(f"The file {path} does not exist.")
 
-    # If the file extension is .json, load as a JSON file
-    if path.suffix == '.json':
-        with open(path, 'r') as f:
-            questions = json.load(f)
-
-    # If the file extension is .jsonl, load as a JSON Lines file
-    elif path.suffix == '.jsonl':
-        questions = []
-        with open(path, 'r') as f:
-            for line in f:
-                questions.append(json.loads(line.strip()))
-
-    # If the file extension is .csv, load as a CSV file
-    elif path.suffix == '.csv':
-        df = pd.read_csv(path)
-        questions = df.to_dict(orient='records')
-
-    else:
-        raise ValueError("Unsupported file extension. Please use .json, .jsonl, or .csv.")
+    # Load as a CSV file
+    df = pd.read_csv(path)
+    questions = df.to_dict(orient='records')
 
     return questions

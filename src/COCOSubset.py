@@ -66,10 +66,17 @@ class COCOSubset(Dataset):
         return image_id_to_categories
 
     def get_present_categories(self, image_id: int) -> list[str]:
+        if image_id not in self.img_ids:
+            raise ValueError(f"Image ID {image_id} not found in the dataset.")
+        
         if self.image_ids_to_categories is None:
             raise ValueError("Could not build the mapping of image IDs to categories.")
+
         return self.image_ids_to_categories.get(image_id, [])
 
     def get_filename(self, image_id: int) -> str:
+        if image_id not in self.img_ids:
+            raise ValueError(f"Image ID {image_id} not found in the dataset.")
+
         image_info = self.coco.loadImgs(image_id)[0]
         return image_info['file_name']
