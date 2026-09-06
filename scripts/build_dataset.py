@@ -10,8 +10,8 @@ if __name__ == "__main__":
         seed = dataset_construction.create_seed(STUDENT_NUMBER)
 
         # Define the annotation file path
-        annotation_path = 'instances_val2017.json'
-        image_dir = 'val2017/'
+        annotation_path = 'data/instances_val2017.json'
+        image_dir = 'data/val2017/'
 
         # Create the COCOSubset object
         coco_subset = dataset_construction.load_coco_subset(annotation_path, image_dir)
