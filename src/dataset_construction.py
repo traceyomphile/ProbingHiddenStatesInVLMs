@@ -63,7 +63,6 @@ def build_question_set(coco: COCOSubset, image_ids: list[int], cooccurrence: dic
     "present" / "absent_random" / "absent_adversarial", each a dict with keys
     image_id, category, question, question_type, ground_truth.
     """
-    vowels = ['a', 'e', 'i', 'o', 'u']
     all_categories = coco.get_category_names()
     question_set = []
     for image_id in image_ids:
@@ -74,46 +73,26 @@ def build_question_set(coco: COCOSubset, image_ids: list[int], cooccurrence: dic
         rng = np.random.default_rng(seed + image_id)  # Ensure different seed per image
         if present_categories:
             present_category = rng.choice(present_categories)
-
-            # Check if present_category starts with a vowel for question phrasing
-            if present_category[0].lower() in vowels:
-                question_set.append({
-                    "image_id": image_id,
-                    "category": present_category,
-                    "question": f"Is there an '{present_category}' in this image? Answer yes or no.",
-                    "question_type": "present",
-                    "ground_truth": True
-                })
-            else:
-                question_set.append({
-                    "image_id": image_id,
-                    "category": present_category,
-                    "question": f"Is there a '{present_category}' in this image? Answer yes or no.",
-                    "question_type": "present",
-                    "ground_truth": True
-                })
+        
+            question_set.append({
+                "image_id": image_id,
+                "category": present_category,
+                "question": f"Is there a '{present_category}' in this image? Answer yes or no.",
+                "question_type": "present",
+                "ground_truth": True
+            })
 
         # Randomly select one absent category for absent_random
         if absent_categories:
             absent_random_category = rng.choice(absent_categories)
 
-            # Check if absent_random_category starts with a vowel for question phrasing
-            if absent_random_category[0].lower() in vowels:
-                question_set.append({
-                    "image_id": image_id,
-                    "category": absent_random_category,
-                    "question": f"Is there an '{absent_random_category}' in this image? Answer yes or no.",
-                    "question_type": "absent_random",
-                    "ground_truth": False
-                })
-            else:
-                question_set.append({
-                    "image_id": image_id,
-                    "category": absent_random_category,
-                    "question": f"Is there a '{absent_random_category}' in this image? Answer yes or no.",
-                    "question_type": "absent_random",
-                    "ground_truth": False
-                })
+            question_set.append({
+                "image_id": image_id,
+                "category": absent_random_category,
+                "question": f"Is there a '{absent_random_category}' in this image? Answer yes or no.",
+                "question_type": "absent_random",
+                "ground_truth": False
+            })
 
         # For absent_adversarial, select an absent category that has high co-occurrence with a present category
         if present_categories and absent_categories:
@@ -132,23 +111,13 @@ def build_question_set(coco: COCOSubset, image_ids: list[int], cooccurrence: dic
                         ),
                 )
 
-                # Check if absent_adversarial_category starts with a vowel for question phrasing
-                if absent_adversarial_category[0].lower() in vowels:
-                    question_set.append({
-                        "image_id": image_id,
-                        "category": absent_adversarial_category,
-                        "question": f"Is there an '{absent_adversarial_category}' in this image? Answer yes or no.",
-                        "question_type": "absent_adversarial",
-                        "ground_truth": False
-                    })
-                else:
-                    question_set.append({
-                        "image_id": image_id,
-                        "category": absent_adversarial_category,
-                        "question": f"Is there a '{absent_adversarial_category}' in this image? Answer yes or no.",
-                        "question_type": "absent_adversarial",
-                        "ground_truth": False
-                    })
+                question_set.append({
+                    "image_id": image_id,
+                    "category": absent_adversarial_category,
+                    "question": f"Is there a '{absent_adversarial_category}' in this image? Answer yes or no.",
+                    "question_type": "absent_adversarial",
+                    "ground_truth": False
+                })
 
     return question_set
 
