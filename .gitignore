@@ -3,3 +3,5 @@ __pycache__/
 .venv
 data/
 src/test_json.py
+instances_val2017.json
+logs/

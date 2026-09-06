@@ -21,7 +21,6 @@ class COCOSubset(Dataset):
         # Build a mapping from image IDs to their present categories
         self.image_ids_to_categories = self._build_image_id_to_categories()
         
-
     def __len__(self):
         return len(self.img_ids)
 
@@ -80,3 +79,15 @@ class COCOSubset(Dataset):
 
         image_info = self.coco.loadImgs(image_id)[0]
         return image_info['file_name']
+
+    def get_annotation_ids(self, image_id: int, categories_id: int | list[int] | None = None) -> list[int]:
+        if image_id not in self.img_ids:
+            raise ValueError(f"Image ID {image_id} not found in the dataset.")
+
+        if categories_id is None:
+            categories_id = []
+
+        return sorted(self.coco.getAnnIds(imgIds=[image_id], catIds=categories_id))
+
+    def get_category_id(self, category_name: str) -> int:
+        return self.coco.getCatIds(catNms=[category_name])[0]
