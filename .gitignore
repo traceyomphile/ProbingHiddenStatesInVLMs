@@ -1,2 +1,5 @@
 val2017/
 __pycache__/
+.venv
+data/
+src/test_json.py
