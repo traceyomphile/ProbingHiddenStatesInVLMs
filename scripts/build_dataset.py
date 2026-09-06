@@ -10,8 +10,8 @@ if __name__ == "__main__":
         seed = dataset_construction.create_seed(STUDENT_NUMBER)
 
         # Define the annotation file path
-        annotation_path = '../instances_val2017.json'
-        image_dir = '../val2017'
+        annotation_path = 'instances_val2017.json'
+        image_dir = 'val2017/'
 
         # Create the COCOSubset object
         coco_subset = dataset_construction.load_coco_subset(annotation_path, image_dir)
@@ -26,7 +26,7 @@ if __name__ == "__main__":
         question_set = dataset_construction.build_question_set(coco_subset, sampled_image_ids, co_occurrences, seed=seed)
 
         # Save the question set to a CSV file
-        output_csv_path = "../data/manifest.csv"
+        output_csv_path = "data/manifest.csv"
         dataset_construction.save_manifest(question_set, output_csv_path)
 
         print(f"Dataset construction completed successfully. Manifest saved to {output_csv_path}")

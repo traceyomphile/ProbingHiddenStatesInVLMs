@@ -158,6 +158,9 @@ def save_manifest(questions: list[dict], path: str) -> None:
     if path.suffix not in acceptable_extensions:
         raise ValueError("Unsupported file extension. Please use .json, .jsonl, or .csv.")
 
+    # Create directory if it doesn't exist
+    path.parent.mkdir(parents=True, exist_ok=True)
+    
     # If the file extension is .json, save as a JSON file
     if path.suffix == '.json':
         with open(path, 'w') as f:
