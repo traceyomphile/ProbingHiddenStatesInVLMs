@@ -67,10 +67,10 @@ def build_question_set(coco: COCOSubset, image_ids: list[int], cooccurrence: dic
     image_id, category, question, question_type, ground_truth.
     """
     vowels = ['a', 'e', 'i', 'o', 'u']
+    all_categories = coco.get_category_names()
     question_set = []
     for image_id in image_ids:
         present_categories = coco.get_present_categories(image_id)
-        all_categories = coco.get_category_names()
         absent_categories = [cat for cat in all_categories if cat not in present_categories]
 
         # Randomly select one present category

@@ -62,13 +62,6 @@ class COCOSubset(Dataset):
         category_ids = [cat["id"] for cat in self.data["categories"]]
         return category_ids
 
-    def get_category_names(self, category_id: int) -> list[str] | None:
-        if self.data is None:
-            raise ValueError("COCO data not loaded. Please ensure the annotation file is provided.")
-    
-        category_name = self.category_mapping.get(category_id, None)
-        return category_name
-
     def get_present_categories(self, image_id: int) -> list[str]:
         if self.data is None:
             raise ValueError("COCO data not loaded. Please ensure the annotation file is provided.")

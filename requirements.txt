@@ -1,0 +1,22 @@
+# Core data libraries
+numpy>=1.26,<3
+pandas>=2.2,<3
+matplotlib>=3.9,<4
+tqdm>=4.66,<5
+
+# Machine learning
+scikit-learn>=1.5,<2
+
+# PyTorch
+torch>=2.5,<3
+torchvision>=0.20,<1
+
+# COCO annotations
+pycocotools>=2.0.8,<3
+
+# Vision Language Model
+transformers>=4.46,<5
+
+# Image/model utilities
+Pillow>=10,<13
+accelerate>=1,<2
