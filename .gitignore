@@ -1,7 +1,8 @@
 val2017/
 __pycache__/
 .venv
-data/
+data/*
+!data/manifest.csv
 src/test_json.py
 instances_val2017.json
 logs/
