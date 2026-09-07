@@ -98,6 +98,56 @@ def test_sample_image_ids_determinism(coco_subset: COCOSubset, n_images: int, se
     assert first_sample == second_sample, "Sampling of image IDs is not deterministic."
     return "Deterministic sampling test passed."
 
+def test_nonempty_present_cats(coco_subset: COCOSubset) -> str:
+    image_ids = coco_subset.get_image_ids()
+    for image_id in image_ids:
+        present_cats = coco_subset.get_present_categories(image_id)
+
+        assert len(present_cats) >= 1, 'An image must have at least one category present.'
+    return 'All images have at least one present category.'
+
+def test_nonempty_absent_cats(coco_subset: COCOSubset) -> str:
+    all_cats = coco_subset.get_category_names()
+    image_ids = coco_subset.get_image_ids()
+
+    for image_id in image_ids:
+        present_cats = coco_subset.get_present_categories(image_id)
+        absent_cats = [cat for cat in all_cats if cat not in present_cats]
+
+        assert len(absent_cats) >= 2, 'Removing an adversarial category from absent categories leaves no absent random category available.'
+    return 'All images have at least two absent categories'
+
+def test_adversarial_fallback_frequency(coco_subset: COCOSubset):
+    image_ids = coco_subset.get_image_ids()
+    all_cats = coco_subset.get_category_names()
+
+    # Compute cooccurences
+    cooccurences = compute_cooccurrence(coco_subset)
+
+    # Initialise counts
+    fallback_count = 0
+    total = len(image_ids)
+
+    for image_id in image_ids:
+        present_categories = coco_subset.get_present_categories(image_id)
+        absent_categories = [cat for cat in all_cats if cat not in present_categories]
+
+        best_pair = None
+        best_count = -1
+        for (cat_a, cat_b), count in cooccurences.items():
+            if cat_a in present_categories and cat_b in absent_categories and count > best_count:
+                best_pair = (cat_a, cat_b)
+                best_count = count
+            elif cat_a in absent_categories and cat_b in present_categories and count > best_count:
+                best_pair = (cat_b, cat_a)
+                best_count = count
+
+        if best_pair is None:
+            fallback_count += 1
+
+    rate = fallback_count / total
+    return f'Fallback triggered on {fallback_count}/{total} images ({rate:.2%})'
+
 if __name__ == "__main__":
     # Define paths and parameters for testing
     manifest_path = "data/manifest.csv"
@@ -146,6 +196,15 @@ if __name__ == "__main__":
 
         sampling_determinism_result = test_sample_image_ids_determinism(coco_subset, n_images, seed)
         logging.info(sampling_determinism_result)
+
+        non_empty_present_cats_results = test_nonempty_present_cats(coco_subset)
+        logging.info(non_empty_present_cats_results)
+
+        non_empty_absent_cats_results = test_nonempty_absent_cats(coco_subset)
+        logging.info(non_empty_absent_cats_results)
+
+        adversarial_fallback_results = test_adversarial_fallback_frequency(coco_subset)
+        logging.info(adversarial_fallback_results)
 
         logging.info("All tests completed successfully.")
     except AssertionError as e:
