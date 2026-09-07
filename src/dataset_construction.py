@@ -1,5 +1,4 @@
 # src.dataset_construction.py
-import json
 import numpy as np
 import pandas as pd
 from itertools import combinations
@@ -8,7 +7,7 @@ from pathlib import Path
 from src.COCOSubset import COCOSubset
 
 # PART A 
-def create_seed(student_number: str):
+def create_seed(student_number: str) -> int:
     """
     Create a seed from the given student number. The student number is used to seed the random number generator.
     Args:
@@ -35,10 +34,7 @@ def compute_cooccurrence(coco: COCOSubset) -> dict[tuple[str, str], int]:
         present_categories = coco.get_present_categories(image_id)
         combinations_of_categories = combinations(sorted(present_categories), 2)
         for pair in combinations_of_categories:
-            if pair in cooccurrence:
-                cooccurrence[pair] += 1
-            else:
-                cooccurrence[pair] = 1
+            cooccurrence[pair] += 1
 
     return dict(cooccurrence)
 
@@ -63,61 +59,57 @@ def build_question_set(coco: COCOSubset, image_ids: list[int], cooccurrence: dic
     """
     all_categories = coco.get_category_names()
     question_set = []
+    rng = np.random.default_rng(seed)
+
     for image_id in image_ids:
         present_categories = coco.get_present_categories(image_id)
         absent_categories = [cat for cat in all_categories if cat not in present_categories]
 
-        # Randomly select one present category
-        rng = np.random.default_rng(seed + image_id)  # Ensure different seed per image
-        if present_categories:
+        # Choose present cat and adversarial negative as the pair in cooccurrence with the highest count
+        best_pair = None
+        best_count = -1
+        for (cat_a, cat_b), count in cooccurrence.items():
+            if cat_a in present_categories and cat_b in absent_categories and count > best_count:
+                best_pair = (cat_a, cat_b)
+                best_count = count
+            elif cat_a in absent_categories and cat_b in present_categories and count > best_count:
+                best_pair = (cat_b, cat_a)
+                best_count = count
+
+        if best_pair is None:
+            # Fallback: no valid adversarial pair found for this image
             present_category = rng.choice(present_categories)
-        
-            question_set.append({
-                "image_id": image_id,
-                "category": present_category,
-                "question": f"Is there a {present_category} in this image? Answer yes or no.",
-                "question_type": "present",
-                "ground_truth": True
-            })
+            absent_adversarial_category = rng.choice(absent_categories)
+        else:
+            present_category, absent_adversarial_category = best_pair
 
-        # Randomly select one absent category for absent_random
-        if absent_categories:
-            absent_random_category = rng.choice(absent_categories)
+        # Avoid removing elements
+        random_absent_pool = [cat for cat in absent_categories if cat != absent_adversarial_category]
+        absent_random_category = rng.choice(random_absent_pool)
 
-            question_set.append({
-                "image_id": image_id,
-                "category": absent_random_category,
-                "question": f"Is there a {absent_random_category} in this image? Answer yes or no.",
-                "question_type": "absent_random",
-                "ground_truth": False
-            })
+        question_set.append({
+            "image_id": image_id,
+            "category": present_category,
+            "question": f"Is there a {present_category} in this image? Answer yes or no.",
+            "question_type": "present",
+            "ground_truth": True
+        })
 
-        # For absent_adversarial, select an absent category that has high co-occurrence with a present category
-        if present_categories and absent_categories:
-            absent_categories.remove(absent_random_category)  # Ensure we don't pick the same category as absent_random
+        question_set.append({
+            "image_id": image_id,
+            "category": absent_random_category,
+            "question": f"Is there a {absent_random_category} in this image? Answer yes or no.",
+            "question_type": "absent_random",
+            "ground_truth": False
+        })
 
-            cooccurring_absent = [
-                cat for cat in absent_categories 
-                if any((present_cat, cat) in cooccurrence or (cat, present_cat) in cooccurrence for present_cat in present_categories)
-            ]
-            if cooccurring_absent:
-                # Choose the absent adversarial category with the highest co-occurrence count
-                absent_adversarial_category = max(
-                    cooccurring_absent, 
-                    key=lambda cat: max(
-                        (max(cooccurrence.get((present_cat, cat), 0), cooccurrence.get((cat, present_cat), 0)) 
-                         for present_cat in present_categories),
-                         default=0
-                        ),
-                )
-
-                question_set.append({
-                    "image_id": image_id,
-                    "category": absent_adversarial_category,
-                    "question": f"Is there a {absent_adversarial_category} in this image? Answer yes or no.",
-                    "question_type": "absent_adversarial",
-                    "ground_truth": False
-                })
+        question_set.append({
+            "image_id": image_id,
+            "category": absent_adversarial_category,
+            "question": f"Is there a {absent_adversarial_category} in this image? Answer yes or no.",
+            "question_type": "absent_adversarial",
+            "ground_truth": False
+        })
 
     return question_set
 
