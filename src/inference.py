@@ -12,19 +12,8 @@ from transformers import (
     AutoProcessor,
     PreTrainedModel, 
     ProcessorMixin,
+    AutoModelForImageTextToText as _AutoModel,
 )
-
-# Keep code reusable across different versions
-try:
-    from transformers import AutoModelForMultimodalLM as _AutoModel
-except ImportError:
-    try:
-        from transformers import AutoModelForImageTextToText as _AutoModel
-    except ImportError:
-        from transformers import AutoModelForVision2Seq as _AutoModel
-
-_MODEL_NAME = 'HuggingFaceTB/SmolVLM-256M-Instruct'
-
 @dataclass
 class InferenceResult:
     image_id: int
@@ -185,42 +174,46 @@ def _answer_confidence(generation_output, generated_tokens_ids, processor) -> fl
 
     return float(math.exp(sum(log_probabilites)))
 
-def _convert_hidden_states(model, hidden_states) -> dict[int, np.ndarray]:
+def _convert_generation_hidden_states(model, generation_hidden_states) -> dict[int, np.ndarray]:
     """
     Convert transformer-layer hidden states to NumPy arrays.
     Exclude the embedding output layer.
     """
-    if hidden_states is None:
-        raise RuntimeError("Model did not return hidden states despite output_hidden_states=True")
+    if generation_hidden_states is None:
+        raise RuntimeError("generate() did not return hidden states despite output_hidden_states=True")
 
     text_config = getattr(model.config, 'text_config', None)
 
     if text_config is not None:
-        num_layers = getattr(
-            text_config,
-            'num_hidden_layers',
-            len(hidden_states) - 1,
-        )
+        num_layers = text_config.num_hidden_layers
     else:
-        num_layers = getattr(
-            model.config,
-            'num_hidden_layers',
-            len(hidden_states) - 1,
-        )
-
-    transformer_states = hidden_states[-num_layers:]
+        num_layers = model.config.num_hidden_layers
 
     result: dict[int, np.ndarray] = {}
 
-    for layer_index, state in enumerate(transformer_states):
-        # Remove the batch dimension since the batch size is 1.
-        state = state[0].detach().cpu()
+    for layer_index, state in range(num_layers):
+        layer_parts = []
 
-        # NumPy does not support bfloat16 directly
-        if state.dtype == torch.bfloat16:
-            state = state.float()
+        for step_hidden_states in generation_hidden_states:
+            # Remove embedding state by taking the final num_layers entries
+            transformer_states = step_hidden_states[-num_layers:]
 
-        result[layer_index] = state.numpy()
+            state = transformer_states[layer_index]
+
+            # Remove the batch dimension since the batch size is 1.
+            state = state[0].detach().cpu()
+
+            # NumPy does not support bfloat16 directly
+            if state.dtype == torch.bfloat16:
+                state = state.float()
+
+            layer_parts.append(state)
+
+        full_layer_sequence = torch.cat(
+            layer_parts,
+            dim=0
+        )
+        result[layer_index] = full_layer_sequence.numpy()
 
     return result
 
@@ -246,8 +239,11 @@ def _run_single_example_implementation(model, processor, image, question: str, i
             do_sample=False,
             return_dict_in_generate=True,
             output_scores=True,
+            output_hidden_states=True
         )
 
+    hidden_states = _convert_generation_hidden_states(model, generation_output.hidden_states)
+    
     full_sequence = generation_output.sequences[0]
 
     generated_token_ids = full_sequence[prompt_length:]
@@ -264,34 +260,6 @@ def _run_single_example_implementation(model, processor, image, question: str, i
         generated_token_ids,
         processor,
     )
-
-    # Obtain one complete sequence of hidden vectors at every transformer layer.
-    full_input_ids = full_sequence.unsqueeze(0)
-
-    forward_inputs = {
-        'input_ids': full_input_ids,
-        'attention_mask': torch.ones_like(full_input_ids),
-    }
-
-    if image_hidden_states is not None:
-        forward_inputs['image_hidden_states'] = image_hidden_states
-    else:
-        # Fallback if cannot cache the vision representation.
-        if 'pixel_values' in inputs:
-            forward_inputs['pixel_values'] = inputs['pixel_values']
-
-        if 'pixel_attention_mask' in inputs:
-            forward_inputs['pixel_attention_mask'] = inputs['pixel_attention_mask']
-
-    with torch.inference_mode():
-        forward_output = model(
-            **forward_inputs,
-            output_hidden_states=True,
-            use_cache=False,
-            return_dict=True,
-        )
-
-    hidden_states = _convert_hidden_states(model, forward_output.hidden_states)
 
     return InferenceResult(
         image_id=-1,
