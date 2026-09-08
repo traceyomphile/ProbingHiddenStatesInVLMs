@@ -99,6 +99,15 @@ def _parse_answer(text: str) -> bool | None:
 
     return match.group(1) == 'yes'
 
+def _apply_confidence_filter(parsed_answer: bool | None, confidence: float, threshold: float = 0.85) -> bool | None:
+    if parsed_answer is None:
+        return None
+
+    if confidence < threshold:
+        return None
+
+    return parsed_answer
+
 def _extract_image_hidden_states(model, inputs: dict):
     """
     @author ChatGPT
@@ -149,10 +158,19 @@ def _generation_inputs(inputs: dict, image_hidden_states=None) -> dict:
 
     return result
 
-def _answer_confidence(generation_output, generated_tokens_ids, processor) -> float:
+def _answer_confidence(model, generation_output, generated_tokens_ids, processor) -> float:
     """
-    Calculate the probability of the generated answer sequence.
+    Calculate the joint probability assigned to the generated answer token(s).
     """
+    transition_scores = model.compute_transition_scores(
+        generation_output.sequences,
+        generation_output.scores,
+        normalize_logits=True
+    )
+
+    # Batch size is 1
+    token_log_probs = transition_scores[0]
+
     tokenizer = getattr(processor, 'tokenizer', None)
 
     special_ids = set()
@@ -160,26 +178,22 @@ def _answer_confidence(generation_output, generated_tokens_ids, processor) -> fl
     if tokenizer is not None:
         special_ids = set(tokenizer.all_special_ids)
 
-    log_probabilites: list[float] = []
+    log_probabilities: list[torch.Tensor] = []
 
-    for scores, token_id_tensor in zip(generation_output.scores, generated_tokens_ids):
-        token_id = int(token_id_tensor.item())
+    for token_id, log_prob in zip(generated_tokens_ids, token_log_probs):
+        token_id = int(token_id.item())
 
         if token_id in special_ids:
             continue
 
-        log_probs = torch.log_softmax(
-            scores[0].float(),
-            dim=-1,
-        )
+        log_probabilities.append(log_prob)
 
-        token_log_prob = float(log_probs[token_id].item())
-        log_probabilites.append(token_log_prob)
-
-    if not log_probabilites:
+    if not log_probabilities:
         return 0.0
 
-    return float(math.exp(sum(log_probabilites)))
+    total_log_prob = torch.stack(log_probabilities).sum()
+
+    return float(torch.exp(total_log_prob).item())
 
 def _convert_generation_hidden_states(model, generation_hidden_states) -> dict[int, np.ndarray]:
     """
@@ -266,13 +280,17 @@ def _run_single_example_implementation(model, processor, image, question: str, i
         skip_special_tokens=True,
     ).strip()
 
-    parsed_answer = _parse_answer(generated_text)
 
     confidence = _answer_confidence(
+        model,
         generation_output,
         generated_token_ids,
         processor,
     )
+
+    parsed_answer = _parse_answer(generated_text)
+    # Accept unclear responses with a very high confidence.
+    parsed_answer = _apply_confidence_filter(parsed_answer, confidence)
 
     return InferenceResult(
         image_id=-1,
