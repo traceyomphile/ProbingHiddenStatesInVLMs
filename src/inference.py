@@ -3,6 +3,7 @@ import os
 import json
 import re
 import torch
+from tqdm import tqdm
 import numpy as np
 from pathlib import Path
 from PIL import Image
@@ -29,6 +30,17 @@ class InferenceResult:
     confidence: float               # Pronbability anssigned to the generated answer token(s)
     hidden_states: dict[int, np.ndarray]    # layer index -> (seq_len, hidden_dim) array --- raw, unpooled
 
+    def __repr__(self):
+        return (
+            f'image_id: {self.image_id}\n'
+            f'category: {self.category}\n'
+            f'question_type: {self.question_type}\n'
+            f'ground_truth: {self.ground_truth}\n'
+            f'generated_text: {self.generated_text}\n'
+            f'parsed_answer: {self.parsed_answer}\n'
+            f'confidence: {self.confidence}\n'
+            f'hidden_states_shape: {self.hidden_states.shape}'
+        )
 @dataclass(frozen=True)
 class HiddenStateItem:
     """One layer from one saved inference result, used for memory-bounded loading."""
@@ -121,7 +133,6 @@ def _extract_image_hidden_states(model, inputs: dict):
 
     kwargs = {
         'pixel_values': inputs['pixel_values'],
-        'return_dict': True,
     }
 
     if 'pixel_attention_mask' in inputs:
@@ -129,6 +140,10 @@ def _extract_image_hidden_states(model, inputs: dict):
 
     with torch.inference_mode():
         image_outputs = model.get_image_features(**kwargs)
+
+    # Some Transformers version return the projected features directly.
+    if torch.is_tensor(image_outputs):
+        return image_outputs.detach()
 
     # For idefics3/SmolVLM, pooler_output contains the vision features after the modality projection
     image_hiddens_states = getattr(image_outputs, 'pooler_output', None)
@@ -233,7 +248,6 @@ def _convert_generation_hidden_states(model, generation_hidden_states) -> dict[i
             # Remove embedding state by taking the final num_layers entries
             transformer_states = step_hidden_states[-num_layers:]
             state = transformer_states[layer_index]
-            print(f"DEBUG: gen_step_layer_shape = {state.shape}")
 
             if state.ndim != 3 or state.shape[0] != 1:
                 raise RuntimeError(
@@ -269,7 +283,6 @@ def _run_single_example_implementation(model, processor, image, question: str, i
     model_inputs = _generation_inputs(inputs, image_hidden_states)
 
     prompt_length = model_inputs['input_ids'].shape[-1]
-    print(f"DEBUG: Prompt_len = {prompt_length}")
 
     # Generate the yes/no answer and keep generation probs
     with torch.inference_mode():
@@ -282,14 +295,9 @@ def _run_single_example_implementation(model, processor, image, question: str, i
             output_hidden_states=True
         )
 
-    print(f"DEBUG: hidden_states_len = {len(generation_output.hidden_states)}")
-
     full_sequence = generation_output.sequences[0]
-    print(f"DEBUG: seq_lens = {generation_output.sequences.shape}")
-    print(f"DEBUG: seq_len = {full_sequence.shape}")
 
     generated_token_ids = full_sequence[prompt_length:]
-    print(f"DEBUG: gen_tokens_len = {len(generated_token_ids)}")
 
     generated_text = processor.decode(
         generated_token_ids,
@@ -306,7 +314,6 @@ def _run_single_example_implementation(model, processor, image, question: str, i
     )
 
     hidden_states = _convert_generation_hidden_states(model, generation_output.hidden_states)
-    print(f"DEBUG: final_hidden_states_shape = {hidden_states.shape}")
 
     return InferenceResult(
         image_id=-1,
@@ -684,50 +691,50 @@ def _run_manifest_in_memory(model, processor, manifest: list[dict], image_dir: s
     grouped_rows = _group_manifest(manifest)
     ordered_results: list[InferenceResult | None] = [None] * len(manifest)
 
-    for image_id, image_rows in grouped_rows.items():
-        first_row = image_rows[0][1]
-        path = _image_path(image_dir, image_id, first_row)
+    with tqdm(total=len(manifest), desc="Running inference", unit='QA') as progress:
+        for image_id, image_rows in grouped_rows.items():
+            first_row = image_rows[0][1]
+            path = _image_path(image_dir, image_id, first_row)
 
-        with Image.open(path) as opened_image:
-            image = opened_image.convert('RGB')
+            with Image.open(path) as opened_image:
+                image = opened_image.convert('RGB')
 
-        # cache vision output ONCE for this image
-        image_hidden_states = None
-        if hasattr(model, 'get_image_features'):
-            first_inputs = _prepare_inputs(
-                model,
-                processor,
-                image,
-                str(first_row['question']),
-            )
-            image_hidden_states = _extract_image_hidden_states(model, first_inputs)
-            del first_inputs
+            # cache vision output ONCE for this image
+            image_hidden_states = None
+            if hasattr(model, 'get_image_features'):
+                first_inputs = _prepare_inputs(
+                    model,
+                    processor,
+                    image,
+                    str(first_row['question']),
+                )
+                image_hidden_states = _extract_image_hidden_states(model, first_inputs)
+                del first_inputs
 
-        # Run unfinished questions.
-        for original_index, row in image_rows:
-            result = _run_single_example_implementation(
-                model,
-                processor,
-                image,
-                str(row['question']),
-                image_hidden_states=image_hidden_states,
-            )
+            # Run unfinished questions.
+            for original_index, row in image_rows:
+                result = _run_single_example_implementation(
+                    model,
+                    processor,
+                    image,
+                    str(row['question']),
+                    image_hidden_states=image_hidden_states,
+                )
 
-            # Add metadata that run_single_example cannot know
-            ordered_results[original_index] = replace(
-                result,
-                image_id=image_id,
-                category=str(row['category']),
-                question_type=str(row['question_type']),
-                ground_truth=_coerce_ground_truth(row['ground_truth']),
-            )
+                # Add metadata that run_single_example cannot know
+                ordered_results[original_index] = replace(
+                    result,
+                    image_id=image_id,
+                    category=str(row['category']),
+                    question_type=str(row['question_type']),
+                    ground_truth=_coerce_ground_truth(row['ground_truth']),
+                )
 
-        # The cached feature tensor is no longer needed after the three questions for this image
-        del image_hidden_states
-        del image
+                progress.update(1)
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            # The cached feature tensor is no longer needed after the three questions for this image
+            del image_hidden_states
+            del image
 
     if any(result is None for result in ordered_results):
         raise RuntimeError('Inference failed to produce one result per manifest row.')
@@ -748,56 +755,62 @@ def _run_manifest_resumable(model, processor, manifest: list[dict], image_dir: s
     grouped_rows = _group_manifest(manifest)
     checkpoint_paths: list[Path | None] = [None] * len(manifest)
 
-    for image_id, image_rows in grouped_rows.items():
-        missing_rows: list[tuple[int, dict]] = []
+    with tqdm(total=len(manifest), desc='Full inference', unit='QA') as progress:
+        for image_id, image_rows in grouped_rows.items():
+            missing_rows: list[tuple[int, dict]] = []
 
-        for original_index, row in image_rows:
-            checkpoint = _checkpoint_path(checkpoint_dir, original_index, image_id)
+            for original_index, row in image_rows:
+                checkpoint = _checkpoint_path(checkpoint_dir, original_index, image_id)
 
-            if _checkpoint_is_valid(checkpoint, expected_manifest_index=original_index, expected_image_id=image_id):
+                if _checkpoint_is_valid(checkpoint, expected_manifest_index=original_index, expected_image_id=image_id):
+                    checkpoint_paths[original_index] = checkpoint
+
+                    # Exisiting checkpoint counts as already completed.
+                    progress.update(1)
+                else:
+                    missing_rows.append((original_index, row))
+
+            if not missing_rows:
+                continue
+
+            first_missing_row = missing_rows[0][1]
+            path = _image_path(image_dir, image_id, first_missing_row)
+
+            with Image.opn(path) as opened_image:
+                image = opened_image.convert('RGB')
+
+            image_hidden_states = None
+
+            if hasattr(model, 'get_image_features'):
+                first_inputs = _prepare_inputs(model, processor, image, str(first_missing_row['question']))
+                image_hidden_states = _extract_image_hidden_states(model, first_inputs)
+                del first_inputs
+
+            for original_index, row in missing_rows:
+                result = _run_single_example_implementation(
+                    model,
+                    processor,
+                    image,
+                    str(row['question']),
+                    image_hidden_states=image_hidden_states,
+                )
+
+                result = replace(
+                    result,
+                    image_id=image_id,
+                    category=str(row['category']),
+                    question_type=str(row['question_type']),
+                    ground_truth=_coerce_ground_truth(row['ground_truth']),
+                )
+
+                checkpoint = _checkpoint_path(checkpoint_dir, original_index, image_id)
+                _save_checkpoint(result, checkpoint, original_index)
                 checkpoint_paths[original_index] = checkpoint
-            else:
-                missing_rows.append((original_index, row))
 
-        if not missing_rows:
-            continue
+                # Avoid retaining a 15+ GB result list in RAM
+                del result
 
-        first_missing_row = missing_rows[0][1]
-        path = _image_path(image_dir, image_id, first_missing_row)
-
-        with Image.opn(path) as opened_image:
-            image = opened_image.convert('RGB')
-
-        image_hidden_states = None
-
-        if hasattr(model, 'get_image_features'):
-            first_inputs = _prepare_inputs(model, processor, image, str(first_missing_row['question']))
-            image_hidden_states = _extract_image_hidden_states(model, first_inputs)
-            del first_inputs
-
-        for original_index, row in missing_rows:
-            result = _run_single_example_implementation(
-                model,
-                processor,
-                image,
-                str(row['question']),
-                image_hidden_states=image_hidden_states,
-            )
-
-            result = replace(
-                result,
-                image_id=image_id,
-                category=str(row['category']),
-                question_type=str(row['question_type']),
-                ground_truth=_coerce_ground_truth(row['ground_truth']),
-            )
-
-            checkpoint = _checkpoint_path(checkpoint_dir, original_index, image_id)
-            _save_checkpoint(result, checkpoint, original_index)
-            checkpoint_paths[original_index] = checkpoint
-
-            # Avoid retaining a 15+ GB result list in RAM
-            del result
+                progress.update(1)
 
         del image_hidden_states
         del image
@@ -822,7 +835,7 @@ def load_model(model_name: str, device: str) -> tuple[PreTrainedModel, Processor
 
     model: PreTrainedModel = _AutoModel.from_pretrained(
         model_name, 
-        torch_dtype=model_dtype,
+        dtype=model_dtype,
         attn_implementation='eager',
     ).to(device)
 
