@@ -39,7 +39,7 @@ class InferenceResult:
             f'generated_text: {self.generated_text}\n'
             f'parsed_answer: {self.parsed_answer}\n'
             f'confidence: {self.confidence}\n'
-            f'hidden_states_shape: {self.hidden_states.shape}'
+            f'hidden_states_len: {len(self.hidden_states)}'
         )
 @dataclass(frozen=True)
 class HiddenStateItem:
@@ -117,6 +117,25 @@ def _parse_answer(text: str) -> bool | None:
         return None
 
     return match.group(1) == 'yes'
+
+def _fallback_parse_answer(text: str) -> bool | None:
+    cleaned = text.strip().lower()
+
+    has_yes = re.search(r'\byes\b', cleaned) is not None
+    has_no = re.search(r'\bno\b', cleaned) is not None
+
+    if has_yes and not has_no:
+        return True
+    if has_no and not has_yes:
+        return False
+    return None
+
+def _parse_with_fallback(text: str) -> bool | None:
+    strict_answer = _parse_answer(text)
+
+    if strict_answer is not None:
+        return strict_answer
+    return _fallback_parse_answer(text)
 
 def _extract_image_hidden_states(model, inputs: dict):
     """
@@ -304,7 +323,7 @@ def _run_single_example_implementation(model, processor, image, question: str, i
         skip_special_tokens=True,
     ).strip()
 
-    parsed_answer = _parse_answer(generated_text)
+    parsed_answer = _parse_with_fallback(generated_text)
 
     confidence = _answer_confidence(
         model,
@@ -385,6 +404,14 @@ def _group_manifest(manifest: list[dict]) -> dict[int, list[tuple[int, dict]]]:
 
     return grouped_rows
 
+def _parse_result_metadata(result: InferenceResult) -> dict:
+    strict_answer = _parse_answer(result.generated_text)
+
+    return {
+        'parsed_answer': result.parsed_answer,
+        'used_fallback': strict_answer is None
+    }
+
 def _result_metadata(result: InferenceResult, layers: list[int]) -> dict:
     """
     Convert non-tensor result fields to JSON-serialisable metadata.
@@ -396,6 +423,7 @@ def _result_metadata(result: InferenceResult, layers: list[int]) -> dict:
         "ground_truth": result.ground_truth,
         "generated_text": result.generated_text,
         "parsed_answer": result.parsed_answer,
+        'parse_result': _parse_result_metadata(result),
         "confidence": result.confidence,
         "layers": layers,
     }
@@ -483,10 +511,10 @@ def _load_results_and_metadata(path: Path) -> tuple[list[InferenceResult], dict[
         result_count = int(metadata.get('result_count', '0'))
 
         for result_index in range(result_count):
-            metadata_key = f'result_result_index'
+            metadata_key = f'result_{result_index}'
 
             if metadata_key not in metadata_key:
-                raise RuntimeError('Missing metadata entry {metadata_key!r} in {path}')
+                raise RuntimeError(f'Missing metadata entry {metadata_key!r} in {path}')
 
             item = json.loads(metadata[metadata_key])
             hidden_states: dict[int, np.ndarray] = {}
@@ -496,7 +524,7 @@ def _load_results_and_metadata(path: Path) -> tuple[list[InferenceResult], dict[
                 tensor_key = f'result_{result_index}.layer_{layer_index}'
 
                 if tensor_key not in file.keys():
-                    raise RuntimeError('Missing tensor {tensor_key!r} in {path}')
+                    raise RuntimeError(f'Missing tensor {tensor_key!r} in {path}')
 
                 tensor = file.get_tensor(tensor_key)
                 tensor = _to_storage_dtype(tensor).cpu()
@@ -776,7 +804,7 @@ def _run_manifest_resumable(model, processor, manifest: list[dict], image_dir: s
             first_missing_row = missing_rows[0][1]
             path = _image_path(image_dir, image_id, first_missing_row)
 
-            with Image.opn(path) as opened_image:
+            with Image.open(path) as opened_image:
                 image = opened_image.convert('RGB')
 
             image_hidden_states = None
@@ -820,6 +848,20 @@ def _run_manifest_resumable(model, processor, manifest: list[dict], image_dir: s
 
     return [path for path in checkpoint_paths if path is not None]
 
+def load_checkpoint_metadata(checkpoint_paths: list[str | Path]) -> list[dict]:
+    results = []
+
+    for path in checkpoint_paths:
+        with safe_open(str(path), framework='pt', device='cpu') as file:
+            metadata = file.metadata() or {}
+
+            if 'result_0' not in metadata:
+                raise RuntimeError(f'Missing result_0 metadata in {path}')
+
+            results.append(json.load(metadata['result_0']))
+
+    return results
+
 def load_model(model_name: str, device: str) -> tuple[PreTrainedModel, ProcessorMixin]:
     if device.startswith('cuda') and not torch.cuda.is_available():
         device = 'cpu'      # Fallback
@@ -836,7 +878,6 @@ def load_model(model_name: str, device: str) -> tuple[PreTrainedModel, Processor
     model: PreTrainedModel = _AutoModel.from_pretrained(
         model_name, 
         dtype=model_dtype,
-        attn_implementation='eager',
     ).to(device)
 
     model.eval()

@@ -7,4 +7,5 @@ src/test_json.py
 instances_val2017.json
 logs/
 Report.docx
+checkpoints/
 
