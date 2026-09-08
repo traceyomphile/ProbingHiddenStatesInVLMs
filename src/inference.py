@@ -1,19 +1,23 @@
 # src.inference.py
 import math
+import os
+import hashlib
+import json
 import re
 import torch
-import gzip
-import pickle
 import numpy as np
 from pathlib import Path
 from PIL import Image
 from dataclasses import dataclass, replace
+from safetensors import safe_open
+from safetensors.torch import save_file
 from transformers import (
     AutoProcessor,
     PreTrainedModel, 
     ProcessorMixin,
     AutoModelForImageTextToText as _AutoModel,
 )
+
 @dataclass
 class InferenceResult:
     image_id: int
@@ -25,6 +29,9 @@ class InferenceResult:
     confidence: float               # Pronbability anssigned to the generated answer token(s)
     hidden_states: dict[int, np.ndarray]    # layer index -> (seq_len, hidden_dim) array --- raw, unpooled
 
+"""
+Helper Methods
+"""
 def _model_device(model) -> torch.device:
     """Find the device on which the model parameters live."""
     return next(model.parameters()).device
@@ -176,8 +183,13 @@ def _answer_confidence(generation_output, generated_tokens_ids, processor) -> fl
 
 def _convert_generation_hidden_states(model, generation_hidden_states) -> dict[int, np.ndarray]:
     """
-    Convert transformer-layer hidden states to NumPy arrays.
-    Exclude the embedding output layer.
+    Convert generation hidden states int:
+        layer_index -> (seq_len, hidden_dim)
+
+    The embedding output is excluded.
+
+    BF16 is converted to FP16 before NumPy conversion so that storage
+    remains 2 bytes per value rather than being doubled to FP32.
     """
     if generation_hidden_states is None:
         raise RuntimeError("generate() did not return hidden states despite output_hidden_states=True")
@@ -191,8 +203,8 @@ def _convert_generation_hidden_states(model, generation_hidden_states) -> dict[i
 
     result: dict[int, np.ndarray] = {}
 
-    for layer_index, state in range(num_layers):
-        layer_parts = []
+    for layer_index in range(num_layers):
+        layer_parts: list[torch.Tensor] = []
 
         for step_hidden_states in generation_hidden_states:
             # Remove embedding state by taking the final num_layers entries
@@ -201,12 +213,13 @@ def _convert_generation_hidden_states(model, generation_hidden_states) -> dict[i
             state = transformer_states[layer_index]
 
             # Remove the batch dimension since the batch size is 1.
-            state = state[0].detach().cpu()
+            state = state[0].detach()
 
             # NumPy does not support bfloat16 directly
             if state.dtype == torch.bfloat16:
-                state = state.float()
+                state = state.to(torch.float16)     # Keep it at 2 bytes per value
 
+            state = state.cpu()
             layer_parts.append(state)
 
         full_layer_sequence = torch.cat(
@@ -308,6 +321,288 @@ def _image_path(image_dir: str, image_id: int, row: dict) -> Path:
         f'Could not find image for COOC image_id={image_id} inside {root}'
     )
 
+def _result_metadata(result: InferenceResult, layers: list[int]) -> dict:
+    """
+    Convert non-tensor result fields to JSON-serialisable metadata.
+    """
+    return {
+        "image_id": result.image_id,
+        "category": result.category,
+        "question_type": result.question_type,
+        "ground_truth": result.ground_truth,
+        "generated_text": result.generated_text,
+        "parsed_answer": result.parsed_answer,
+        "confidence": result.confidence,
+        "layers": layers,
+    }
+
+def _build_safeternsors_payload(
+        results: list[InferenceResult], 
+        extra_metadata: dict[str, str] | None = None
+) -> tuple[dict[str, torch.Tensor], dict[str, str]]:
+    """
+    Convert InferenceResults into a SafeTensors tensor dictionary plus string metadata.
+    """
+    tensors: dict[str, torch.Tensor] = {}
+    metadata: dict[str, str] = {
+        'format': 'vlm_inference_results_v1',
+        'result_count': str(len(results))
+    }
+
+    for result_index, result in enumerate(results):
+        layers = sorted(results.hidden_states.keys())
+
+        for layer_index in layers:
+            array = np.asarray(result.hidden_states[layer_index])
+
+            # SafeTensors expects dense contiguous tensors.
+            array = np.ascontiguousarray(array)
+
+            tensor = torch.from_numpy(array).contiguous()
+
+            key = (
+                f"result_{result_index}."
+                f"layer_{layer_index}"
+            )
+
+            tensors[key] = tensor
+
+        metadata[f"result_{result_index}"] = json.dumps(
+            _result_metadata(result, layers),
+            separators=(",", ":")
+        )
+
+    if extra_metadata:
+        for key, value in extra_metadata.items():
+            metadata[str(key)] = str(value)
+
+    return tensors, metadata
+
+def _atomic_save_results(results: list[InferenceResult], path: Path, extra_metadata: dict[str, str] | None = None) -> None:
+    """
+    Automatically save results using SafeTensors.
+    Data is first written to an temp file in the same dir, then os.replace() moves it into place.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    tensors, metadata = _build_safeternsors_payload(results, extra_metadata)
+
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+
+    try:
+        save_file(tensors, str(temp_path))
+
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+def _load_results_and_metadata(path: Path) -> tuple[list[InferenceResult], dict[str, str]]:
+    """
+    Load a SafeTensors inference-results file.
+    """
+    results: list[InferenceResult] = []
+
+    with safe_open(str(path), framework='pt', device='cpu') as file:
+        metadata = file.metadata() or {}
+        result_count = int(metadata.get('result_count', '0'))
+
+        for result_index in range(result_count):
+            metadata_key = f"result_{result_index}"
+
+            if metadata_key not in metadata:
+                raise RuntimeError(f"Missing metadata entry {metadata_key!r} in {path}")
+
+            item = json.loads(metadata[metadata_key])
+            hidden_states: dict[int, np.ndarray] = {}
+
+            for layer_index in item['layers']:
+                tensor_key = (
+                    f"result_{result_index}."
+                    f"layer_{layer_index}"
+                )
+
+                tensor = file.get_tensor(tensor_key)
+
+                # Make an independent NumPy copy before the SafeTensors file handle is closed.
+                hidden_states[int(layer_index)] = tensor.cpu().numpy().copy()
+
+            results.append(
+                InferenceResult(
+                    image_id=int(item['image_id']),
+                    category=str(item['category']),
+                    question_type=str(item['question_type']),
+                    ground_truth=bool(item['ground_truth']),
+                    generated_text=str(item['generated_text']),
+                    parsed_answer=item['parsed_answer'],
+                    confidence=float(item['confidence']),
+                    hidden_states=hidden_states,
+                )
+            )
+
+    return results, metadata
+
+def _checkpoint_path(checkpoint_dir: Path, manifest_index: int, image_id: int) -> Path:
+    """One checkpoint file per QA pair."""
+    return (
+        checkpoint_dir /
+        (
+            f"row_{manifest_index:06d}_"
+            f"image_{image_id:012d}"
+            f".safetensors"
+        )
+    )
+
+def _load_checkpoint(path: Path) -> InferenceResult | None:
+    """Load a valid checkpoint"""
+    if not path.exists(): 
+        return None
+
+    try:
+        results, metadata = _load_results_and_metadata(path)
+
+        if len(results) != 1:
+            return None
+
+        return results[0]
+    except Exception:
+        # A bad checkpoint should not destroy the run.
+        return None
+
+def _save_checkpoint(result: InferenceResult, path: Path, manifest_index: int) -> None:
+    """
+    Atomically persist one completed QA result.
+    """ 
+    _atomic_save_results(
+        [result], 
+        path, 
+        extra_metadata={
+            'manifest_index': str(manifest_index)
+        },
+    )
+
+def _run_manifest(model, processor, manifest: list[dict], image_dir: str, checkpoint_dir: Path | None) -> list[InferenceResult]:
+    """Shared implementation for normal and resumable inference."""
+    if not manifest: 
+        return []
+
+    # Group rows by image to run the vision encoder once
+    grouped_rows: dict[int, list[tuple[int, dict]]] = {}
+
+    for index, row in enumerate(manifest):
+        image_id = int(row['image_id'])
+
+        grouped_rows.setdefault(image_id, []).append(
+            (index, row)
+        )
+
+    ordered_results: list[InferenceResult | None] = [
+        None
+        for _ in manifest
+    ]
+
+    if checkpoint_dir is not None:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    for image_id, image_rows in grouped_rows.items():
+        # A resumed run need not load the image when all three questions already have valid checkpoint
+        missing_rows: list[tuple[int, dict]] = []
+
+        for original_index, row in image_rows:
+            if checkpoint_dir is None:
+                missing_rows.append((original_index, row))
+                continue
+
+            checkpoint = _checkpoint_path(checkpoint_dir, original_index, image_id)
+            cached_result = _load_checkpoint(checkpoint)
+
+            if cached_result is not None:
+                ordered_results[original_index] = cached_result
+                continue
+
+            missing_rows.append((original_index, row))
+
+        # Every question belonging to this image is already done.
+        if not missing_rows:
+            continue
+
+        # Load the image only if at least one question still needs work.
+        first_missing_row = missing_rows[0][1]
+
+        path = _image_path(image_dir, image_id, first_missing_row)
+
+        with Image.open(path) as opened_image:
+            image = opened_image.convert('RGB')
+
+        # cache vision output ONCE for this image
+        image_hidden_states = None
+        if hasattr(model, 'get_image_features'):
+            first_question = str(first_missing_row['question'])
+
+            first_inputs = _prepare_inputs(
+                model,
+                processor,
+                image,
+                first_question,
+            )
+
+            image_hidden_states = _extract_image_hidden_states(model, first_inputs)
+
+            # first_inputs is no longer required
+            del first_inputs
+
+        # Run unfinished questions.
+        for original_index, row in missing_rows:
+            result = _run_single_example_implementation(
+                model,
+                processor,
+                image,
+                str(row['question']),
+                image_hidden_states=image_hidden_states,
+            )
+
+            # Add metadata that run_single_example cannot know
+            result = replace(
+                result,
+                image_id=image_id,
+                category=str(row['category']),
+                question_type=str(row['question_type']),
+                ground_truth=_coerce_ground_truth(row['ground_truth']),
+            )
+
+            ordered_results[original_index] = result
+
+            # Once this call returns successfully, this QA pair survives a later crash
+            if checkpoint_dir is not None:
+                checkpoint = _checkpoint_path(checkpoint_dir, original_index, image_id)
+                _save_checkpoint(result, checkpoint, original_index)
+
+        # The cached feature tensor is no longer needed after the three questions for this image
+        del image_hidden_states
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if any(result is None for result in ordered_results):
+        raise RuntimeError(
+            'Inference failed to produce one result per manifest row.'
+        )
+
+    return [
+        result
+        for result in ordered_results
+        if result is not None
+    ]
+
+# Additional resumable interface
+def run_inference_resumable(model, processor, manifest: list[dict], image_dir: str, checkpoint_dir: str) -> list[InferenceResult]:
+    """
+    Run inference with an atomic SafeTensors checkpoint after every QA pair.
+
+    Existing valid checkpoints are automatically loaded and skipped.
+    """
+    return _run_manifest(model, processor, manifest, image_dir, checkpoint_dir=Path(checkpoint_dir))
+
 def load_model(model_name: str, device: str) -> tuple[PreTrainedModel, ProcessorMixin]:
     if device.startswith('cuda') and not torch.cuda.is_available():
         device = 'cpu'      # Fallback
@@ -340,143 +635,22 @@ def run_inference_on_manifest(model, processor, manifest: list[dict], image_dir:
     Iterates the manifest, caching the vision-encoder pass per image_id rather than
     per question if your architecture allows it. Returns one InferenceResult per row.
     """
-    if not manifest: 
-        return []
-
-    # Group rows by image to run the vision encoder once
-    grouped_rows: dict[int, list[tuple[int, dict]]] = {}
-
-    for index, row in enumerate(manifest):
-        image_id = int(row['image_id'])
-
-        grouped_rows.setdefault(image_id, []).append(
-            (index, row)
-        )
-
-    ordered_results: list[InferenceResult | None] = [
-        None
-        for _ in manifest
-    ]
-
-    for image_id, image_rows in grouped_rows.items():
-        first_row = image_rows[0][1]
-
-        path = _image_path(image_dir, image_id, first_row)
-
-        with Image.open(path) as opened_image:
-            image = opened_image.convert('RGB')
-
-        # cache vision output ONCE for this image
-        image_hidden_states = None
-        if hasattr(model, 'get_image_features'):
-            first_question = str(first_row['question'])
-
-            first_inputs = _prepare_inputs(
-                model,
-                processor,
-                image,
-                first_question,
-            )
-
-            image_hidden_states = _extract_image_hidden_states(model, first_inputs)
-
-        for original_index, row in image_rows:
-            result = _run_single_example_implementation(
-                model,
-                processor,
-                image,
-                str(row['question']),
-                image_hidden_states=image_hidden_states,
-            )
-
-            # Add metadata that run_single_example cannot know
-            result = replace(
-                result,
-                image_id=image_id,
-                category=str(row['category']),
-                question_type=str(row['question_type']),
-                ground_truth=_coerce_ground_truth(row['ground_truth']),
-            )
-
-            ordered_results[original_index] = result
-
-        # The cached feature tensor is no longer needed after the three questions for this image
-        del image_hidden_states
-
-    if any(result is None for result in ordered_results):
-        raise RuntimeError(
-            'Inference failed to produce one result per manifest row.'
-        )
-
-    return [
-        result
-        for result in ordered_results
-        if result is not None
-    ]
+    return _run_manifest(model, processor, manifest, image_dir, checkpoint_dir=None)
 
 def save_results(results: list[InferenceResult], path: str) -> None:
     """
-    Save inference results, including the unpooled NumPy hidden-state arrays.
+    Save all inference results as SafeTensors.
 
-    gzip + pickle is used because the hidden states are large multidimensional
-    NumPy arrays and are unsuitable for normal JSON serialization.
+    Hidden states are stored as tensors.
+    Results metadata is stored in the SafeTensors metadata header.
     """
-    output_path = Path(path)
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    serialisable = []
-
-    for result in results:
-        serialisable.append(
-            {
-                'image_id': result.image_id,
-                'category': result.category,
-                'question_type': result.question_type,
-                'ground_truth': result.ground_truth,
-                'generated_text': result.generated_text,
-                'parsed_answer': result.parsed_answer,
-                'confidence': result.confidence,
-                'hidden_states': result.hidden_states,
-            }
-        )
-
-    with gzip.open(output_path, 'wb') as file:
-        pickle.dump(
-            serialisable,
-            file,
-            protocol=pickle.HIGHEST_PROTOCOL,
-        )
+    _atomic_save_results(results, Path(path))
 
 def load_results(path: str) -> list[InferenceResult]:
     """
     Load results previously written by save_results().
     """
-    input_path = Path(path)
-
-    with gzip.open(input_path, 'rb') as file:
-        serialised = pickle.load(file)
-
-    results: list[InferenceResult] = []
-
-    for item in serialised:
-        hidden_states = {
-            int(layer): np.asarray(values)
-            for layer, values in item['hidden_states'].items()
-        }
-
-        results.append(
-            InferenceResult(
-                image_id=int(item['image_id']),
-                category=str(item['category']),
-                question_type=str(item['question_type']),
-                ground_truth=bool(item['ground_truth']),
-                generated_text=str(item['generated_text']),
-                parsed_answer=item['parsed_answer'],
-                confidence=float(item['confidence']),
-                hidden_states=hidden_states,
-            )
-        )
+    results, _ = _load_results_and_metadata(Path(path))
 
     return results
 

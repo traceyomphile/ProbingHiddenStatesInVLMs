@@ -16,6 +16,8 @@ pycocotools>=2.0.8,<3
 
 # Vision Language Model
 transformers>=4.46,<5
+safetensors>=0.4.5,<1.0.0
+tokenizers>=0.20,<0.22.0
 
 # Image/model utilities
 Pillow>=10,<13
