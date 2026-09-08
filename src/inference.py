@@ -99,15 +99,6 @@ def _parse_answer(text: str) -> bool | None:
 
     return match.group(1) == 'yes'
 
-def _apply_confidence_filter(parsed_answer: bool | None, confidence: float, threshold: float = 0.85) -> bool | None:
-    if parsed_answer is None:
-        return None
-
-    if confidence < threshold:
-        return None
-
-    return parsed_answer
-
 def _extract_image_hidden_states(model, inputs: dict):
     """
     @author ChatGPT
@@ -225,6 +216,7 @@ def _convert_generation_hidden_states(model, generation_hidden_states) -> dict[i
             transformer_states = step_hidden_states[-num_layers:]
 
             state = transformer_states[layer_index]
+            print(f"DEBUG: gen_step_layer_shape = {state.shape}")
 
             # Remove the batch dimension since the batch size is 1.
             state = state[0].detach()
@@ -257,6 +249,7 @@ def _run_single_example_implementation(model, processor, image, question: str, i
     model_inputs = _generation_inputs(inputs, image_hidden_states)
 
     prompt_length = model_inputs['input_ids'].shape[-1]
+    print(f"DEBUG: Prompt_len = {prompt_length}")
 
     # Generate the yes/no answer and keep generation probs
     with torch.inference_mode():
@@ -269,17 +262,24 @@ def _run_single_example_implementation(model, processor, image, question: str, i
             output_hidden_states=True
         )
 
+    print(f"DEBUG: hidden_states_len = {len(generation_output.hidden_states)}")
+
     hidden_states = _convert_generation_hidden_states(model, generation_output.hidden_states)
-    
+    print(f"DEBUG: final_hidden_states_shape = {hidden_states.shape}")
+
     full_sequence = generation_output.sequences[0]
+    print(f"DEBUG: seq_lens = {generation_output.sequences.shape}")
+    print(f"DEBUG: seq_len = {full_sequence.shape}")
 
     generated_token_ids = full_sequence[prompt_length:]
+    print(f"DEBUG: gen_tokens_len = {len(generated_token_ids)}")
 
     generated_text = processor.decode(
         generated_token_ids,
         skip_special_tokens=True,
     ).strip()
 
+    parsed_answer = _parse_answer(generated_text)
 
     confidence = _answer_confidence(
         model,
@@ -287,10 +287,6 @@ def _run_single_example_implementation(model, processor, image, question: str, i
         generated_token_ids,
         processor,
     )
-
-    parsed_answer = _parse_answer(generated_text)
-    # Accept unclear responses with a very high confidence.
-    parsed_answer = _apply_confidence_filter(parsed_answer, confidence)
 
     return InferenceResult(
         image_id=-1,
@@ -368,7 +364,7 @@ def _build_safeternsors_payload(
     }
 
     for result_index, result in enumerate(results):
-        layers = sorted(results.hidden_states.keys())
+        layers = sorted(result.hidden_states.keys())
 
         for layer_index in layers:
             array = np.asarray(result.hidden_states[layer_index])
@@ -408,7 +404,7 @@ def _atomic_save_results(results: list[InferenceResult], path: Path, extra_metad
     temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
 
     try:
-        save_file(tensors, str(temp_path))
+        save_file(tensors, str(temp_path), metadata=metadata)
 
         os.replace(temp_path, path)
     finally:
