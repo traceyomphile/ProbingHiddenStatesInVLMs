@@ -1,7 +1,5 @@
 # src.inference.py
-import math
 import os
-import hashlib
 import json
 import re
 import torch
@@ -18,6 +16,8 @@ from transformers import (
     AutoModelForImageTextToText as _AutoModel,
 )
 
+RESULT_FORMAT = 'vlm_inference_results_v1'
+MAX_BATCH_BYTES = 8 * 1024 * 1024  # 8MB
 @dataclass
 class InferenceResult:
     image_id: int
@@ -29,19 +29,28 @@ class InferenceResult:
     confidence: float               # Pronbability anssigned to the generated answer token(s)
     hidden_states: dict[int, np.ndarray]    # layer index -> (seq_len, hidden_dim) array --- raw, unpooled
 
+@dataclass(frozen=True)
+class HiddenStateItem:
+    """One layer from one saved inference result, used for memory-bounded loading."""
+    image_id: int
+    category: str
+    question_type: str
+    ground_truth: bool
+    generated_text: str
+    parsed_answer: bool | None
+    confidence: float 
+    layer_index: int
+    hidden_state: np.ndarray
+
 """
 Helper Methods
 """
 def _model_device(model) -> torch.device:
-    """Find the device on which the model parameters live."""
+    """Return the device on which the model parameters live."""
     return next(model.parameters()).device
 
 def _built_prompt(processor, question: str) -> str:
-    """
-    Build the multimodal chat prompt.
-    We explicitly request only yes/no so parsing is deterministic
-    and generated answers remain short.
-    """
+    """Build the multimodal chat prompt for one image/question pair."""
     messages = [
         {
             'role': 'user',
@@ -85,8 +94,6 @@ def _parse_answer(text: str) -> bool | None:
         None -> unclear
     """
     cleaned = text.strip().lower()
-
-    # Occasionally decodeed text can contain an 'assistant: prefix.
     cleaned = re.sub(r'^assistant\s*:\s*', '', cleaned)
 
     match = re.fullmatch(
@@ -153,6 +160,9 @@ def _answer_confidence(model, generation_output, generated_tokens_ids, processor
     """
     Calculate the joint probability assigned to the generated answer token(s).
     """
+    if generation_output.scores is None:
+        raise RuntimeError('generate() did not return scores despite output_scores=true')
+
     transition_scores = model.compute_transition_scores(
         generation_output.sequences,
         generation_output.scores,
@@ -164,15 +174,12 @@ def _answer_confidence(model, generation_output, generated_tokens_ids, processor
 
     tokenizer = getattr(processor, 'tokenizer', None)
 
-    special_ids = set()
-
-    if tokenizer is not None:
-        special_ids = set(tokenizer.all_special_ids)
+    special_ids = set(tokenizer.all_special_ids) if tokenizer is not None else set()
 
     log_probabilities: list[torch.Tensor] = []
 
-    for token_id, log_prob in zip(generated_tokens_ids, token_log_probs):
-        token_id = int(token_id.item())
+    for token_id_tensor, log_prob in zip(generated_tokens_ids, token_log_probs):
+        token_id = int(token_id_tensor.item())
 
         if token_id in special_ids:
             continue
@@ -183,8 +190,13 @@ def _answer_confidence(model, generation_output, generated_tokens_ids, processor
         return 0.0
 
     total_log_prob = torch.stack(log_probabilities).sum()
-
     return float(torch.exp(total_log_prob).item())
+
+def _to_storage_dtype(state: torch.Tensor) -> torch.Tensor:
+    """Store floating hidden states as FP16 to keep raw cache manageable."""
+    if state.is_floating_point() and state.dtype != torch.float16:
+        state = state.to(torch.float16)
+    return state
 
 def _convert_generation_hidden_states(model, generation_hidden_states) -> dict[int, np.ndarray]:
     """
@@ -212,27 +224,35 @@ def _convert_generation_hidden_states(model, generation_hidden_states) -> dict[i
         layer_parts: list[torch.Tensor] = []
 
         for step_hidden_states in generation_hidden_states:
+            if len(step_hidden_states) < num_layers:
+                raise RuntimeError(
+                    "Generation returned fewer hidden-state entries than the model has "
+                    f"transformer layers: got {len(step_hidden_states)}, expected at least {num_layers}"
+                )
+            
             # Remove embedding state by taking the final num_layers entries
             transformer_states = step_hidden_states[-num_layers:]
-
             state = transformer_states[layer_index]
             print(f"DEBUG: gen_step_layer_shape = {state.shape}")
 
+            if state.ndim != 3 or state.shape[0] != 1:
+                raise RuntimeError(
+                    'Expected generation hidden state with shape '
+                    f'(1, seq_len, hidden_dim), got {tuple(state.shape)}'
+                )
+
             # Remove the batch dimension since the batch size is 1.
             state = state[0].detach()
-
-            # NumPy does not support bfloat16 directly
-            if state.dtype == torch.bfloat16:
-                state = state.to(torch.float16)     # Keep it at 2 bytes per value
-
-            state = state.cpu()
+            state = _to_storage_dtype(state).cpu().contiguous()
             layer_parts.append(state)
 
+        if not layer_parts:
+            raise RuntimeError('generated() returned an empty hidden-state sequence')
         full_layer_sequence = torch.cat(
             layer_parts,
             dim=0
         )
-        result[layer_index] = full_layer_sequence.numpy()
+        result[layer_index] = full_layer_sequence.numpy().copy()
 
     return result
 
@@ -264,9 +284,6 @@ def _run_single_example_implementation(model, processor, image, question: str, i
 
     print(f"DEBUG: hidden_states_len = {len(generation_output.hidden_states)}")
 
-    hidden_states = _convert_generation_hidden_states(model, generation_output.hidden_states)
-    print(f"DEBUG: final_hidden_states_shape = {hidden_states.shape}")
-
     full_sequence = generation_output.sequences[0]
     print(f"DEBUG: seq_lens = {generation_output.sequences.shape}")
     print(f"DEBUG: seq_len = {full_sequence.shape}")
@@ -287,6 +304,9 @@ def _run_single_example_implementation(model, processor, image, question: str, i
         generated_token_ids,
         processor,
     )
+
+    hidden_states = _convert_generation_hidden_states(model, generation_output.hidden_states)
+    print(f"DEBUG: final_hidden_states_shape = {hidden_states.shape}")
 
     return InferenceResult(
         image_id=-1,
@@ -335,6 +355,29 @@ def _image_path(image_dir: str, image_id: int, row: dict) -> Path:
         f'Could not find image for COOC image_id={image_id} inside {root}'
     )
 
+def _validate_manifest_row(row: dict, index: int) -> None:
+    """Fail early with a useful error when a required manifest field is missing."""
+    required = {
+        'image_id',
+        'category',
+        'question',
+        'question_type',
+        'ground_truth',
+    }
+    missing = sorted(required.difference(row))
+    if missing:
+        raise KeyError(f'Manifest row {index} is missing required fields: {missing}')
+
+def _group_manifest(manifest: list[dict]) -> dict[int, list[tuple[int, dict]]]:
+    grouped_rows: dict[int, list[tuple[int, dict]]] = {}
+
+    for index, row in enumerate(manifest):
+        _validate_manifest_row(row, index)
+        image_id = int(row['image_id'])
+        grouped_rows.setdefault(image_id, []).append((index, row))
+
+    return grouped_rows
+
 def _result_metadata(result: InferenceResult, layers: list[int]) -> dict:
     """
     Convert non-tensor result fields to JSON-serialisable metadata.
@@ -359,7 +402,7 @@ def _build_safeternsors_payload(
     """
     tensors: dict[str, torch.Tensor] = {}
     metadata: dict[str, str] = {
-        'format': 'vlm_inference_results_v1',
+        'format': RESULT_FORMAT,
         'result_count': str(len(results))
     }
 
@@ -368,6 +411,12 @@ def _build_safeternsors_payload(
 
         for layer_index in layers:
             array = np.asarray(result.hidden_states[layer_index])
+
+            if array.ndim != 2:
+                raise ValueError(
+                    f"Hidden state for result {result_index}, layer {layer_index} must be 2-D "
+                    f"(seq_len, hidden_dim); got shape {array.shape}."
+                )
 
             # SafeTensors expects dense contiguous tensors.
             array = np.ascontiguousarray(array)
@@ -412,34 +461,39 @@ def _atomic_save_results(results: list[InferenceResult], path: Path, extra_metad
             temp_path.unlink()
 
 def _load_results_and_metadata(path: Path) -> tuple[list[InferenceResult], dict[str, str]]:
-    """
-    Load a SafeTensors inference-results file.
-    """
+    """Load a SafeTensors results file created by _atomic_save_results"""
     results: list[InferenceResult] = []
 
     with safe_open(str(path), framework='pt', device='cpu') as file:
         metadata = file.metadata() or {}
+
+        if metadata.get('format') != RESULT_FORMAT:
+            raise RuntimeError(
+                f'Unsupported or missing inference-results format in {path}: '
+                f'{metadata.get('format')!r}'
+            )
+
         result_count = int(metadata.get('result_count', '0'))
 
         for result_index in range(result_count):
-            metadata_key = f"result_{result_index}"
+            metadata_key = f'result_result_index'
 
-            if metadata_key not in metadata:
-                raise RuntimeError(f"Missing metadata entry {metadata_key!r} in {path}")
+            if metadata_key not in metadata_key:
+                raise RuntimeError('Missing metadata entry {metadata_key!r} in {path}')
 
             item = json.loads(metadata[metadata_key])
             hidden_states: dict[int, np.ndarray] = {}
 
-            for layer_index in item['layers']:
-                tensor_key = (
-                    f"result_{result_index}."
-                    f"layer_{layer_index}"
-                )
+            for layer_index in item.get('layers', []):
+                layer_index = int(layer_index)
+                tensor_key = f'result_{result_index}.layer_{layer_index}'
+
+                if tensor_key not in file.keys():
+                    raise RuntimeError('Missing tensor {tensor_key!r} in {path}')
 
                 tensor = file.get_tensor(tensor_key)
-
-                # Make an independent NumPy copy before the SafeTensors file handle is closed.
-                hidden_states[int(layer_index)] = tensor.cpu().numpy().copy()
+                tensor = _to_storage_dtype(tensor).cpu()
+                hidden_states[layer_index] = tensor.numpy().copy()
 
             results.append(
                 InferenceResult(
@@ -456,32 +510,155 @@ def _load_results_and_metadata(path: Path) -> tuple[list[InferenceResult], dict[
 
     return results, metadata
 
+def _array_nbytes_from_shape(shape: list[int] | tuple[int, ...], dtype: str) -> int:
+    """Calculate tensor size without loading the tensor."""
+    dtype_sizes = {
+        'BOOL': 1,
+        'U8': 1,
+        'I8': 1,
+        'I16': 2,
+        'F16': 2,
+        'BF16': 2,
+        'I32': 4,
+        'F32': 4,
+        'I64': 8,
+        'F64': 8,
+    }
+
+    if dtype not in dtype_sizes:
+        raise ValueError(f'Unsupported dtype: {dtype}')
+
+    num_values = 1
+    for dimenstion in shape:
+        num_values *= dimenstion
+
+    return num_values * dtype_sizes[dtype]
+
+def _iter_hidden_state_batches(checkpoint_dir: str | Path, max_batch_bytes: int = MAX_BATCH_BYTES):
+    """
+    Load multiple hidden-state tensors into RAM at once, 
+    while keeping the total hidden-state payload of each batch under max_batch_bytes.
+
+    Yields:
+        list[HiddenStateItem]
+
+    Each batch may contain several examples/layers.
+
+    """
+    if max_batch_bytes <= 0:
+        raise ValueError('max_batch_bytes must be positive')
+    
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_paths = sorted(checkpoint_dir.glob('row_*.safetensors'))
+
+    batch: list[HiddenStateItem] = []
+    batch_bytes = 0
+
+    for checkpoint_path in checkpoint_paths:
+        with safe_open(str(checkpoint_path), framework='pt', device='cpu') as file:
+            metadata = file.metadata() or {}
+
+            if metadata.get('format') != RESULT_FORMAT:
+                raise RuntimeError(f'Unsupported checkpoint format in {checkpoint_path}')
+            
+            if int(metadata.get('result_count', '0')) != 1:
+                raise RuntimeError(f'Expected one result in {checkpoint_path}')
+
+            if 'result_0' not in metadata:
+                raise RuntimeError('Missing result_0 metadata in {checkpoint_path}')
+
+            item = json.loads(metadata['result_0'])
+
+            for layer_index in item['layers']:
+                layer_index = int(layer_index)
+                tensor_key = f"result_0.layer_{layer_index}"
+                tensor_slice = file.get_slice(tensor_key)
+                shape = tensor_slice.get_shape()
+                dtype = tensor_slice.get_dtype()
+                tensor_bytes = _array_nbytes_from_shape(shape, dtype)
+
+                # Return to current batch first if adding current batch exceeds budget
+                if (batch and batch_bytes + tensor_bytes > max_batch_bytes):
+                    yield batch
+                    batch = []
+                    batch_bytes = 0
+
+                # Materialise the whole hidden-state tensor
+                tensor = file.get_tensor(tensor_key)
+                tensor = _to_storage_dtype(tensor).cpu()
+                hidden_state = tensor.numpy().copy()
+
+                result_item = HiddenStateItem(
+                    image_id=int(item['image_id']),
+                    category=str(item['category']),
+                    question_type=str(item['question_type']),
+                    ground_truth=bool(item['ground_truth']),
+                    generated_text=str(item['generated_text']),
+                    parsed_answer=item['parsed_answer'],
+                    confidence=float(item['confidence']),
+                    layer_index=int(layer_index),
+                    hidden_state=hidden_state,
+                )
+
+                batch.append(result_item)
+                batch_bytes += tensor_bytes
+
+    if batch:
+        yield batch
+
 def _checkpoint_path(checkpoint_dir: Path, manifest_index: int, image_id: int) -> Path:
     """One checkpoint file per QA pair."""
-    return (
-        checkpoint_dir /
-        (
-            f"row_{manifest_index:06d}_"
-            f"image_{image_id:012d}"
-            f".safetensors"
-        )
+    return checkpoint_dir / (
+            f"row_{manifest_index:06d}_image_{image_id:012d}.safetensors"
     )
 
-def _load_checkpoint(path: Path) -> InferenceResult | None:
+
+def _checkpoint_is_valid(path: Path, expected_manifest_index: int | None = None, expected_image_id: int | None = None) -> bool:
     """Load a valid checkpoint"""
     if not path.exists(): 
         return None
 
     try:
-        results, metadata = _load_results_and_metadata(path)
+        with safe_open(str(path), framework='pt', device='cpu') as file:
+            metadata = file.metadata() or {}
 
-        if len(results) != 1:
-            return None
+            if metadata.get('format') != 'vlm_inference_results_v1':
+                return False
 
-        return results[0]
+            if int(metadata.get('result_count', '0')) != 1:
+                return False
+
+            if expected_manifest_index is not None:
+                if metadata.get('manifest_index') != str(expected_manifest_index):
+                    return False
+
+            if 'result_0' not in metadata:
+                return False
+
+            item = json.loads(metadata['result_0'])
+
+            if expected_image_id is not None and int(item.get('image_id', -1)) != expected_image_id:
+                return False
+            
+            layers = item.get('layers')
+            if not isinstance(layers, list):
+                return False
+
+            tensors_keys = set(file.keys())
+            # Confirm every expected hidden-state tensor exists.
+            for layer_index in layers:
+                expected_key = f"result_0.layer_{layer_index}"
+                if expected_key not in tensors_keys:
+                    return False
+
+                shape = file.get_slice(expected_key).get_shape()
+                if len(shape) != 2 or any(int(dimension) <= 0 for dimension in shape):
+                    return False
+
+        return True
     except Exception:
         # A bad checkpoint should not destroy the run.
-        return None
+        return False
 
 def _save_checkpoint(result: InferenceResult, path: Path, manifest_index: int) -> None:
     """
@@ -495,55 +672,21 @@ def _save_checkpoint(result: InferenceResult, path: Path, manifest_index: int) -
         },
     )
 
-def _run_manifest(model, processor, manifest: list[dict], image_dir: str, checkpoint_dir: Path | None) -> list[InferenceResult]:
-    """Shared implementation for normal and resumable inference."""
+def _run_manifest_in_memory(model, processor, manifest: list[dict], image_dir: str) -> list[InferenceResult]:
+    """
+    Memory-safe full-run inference.
+    Each completed QA pair is written immediately to its SafeTensors checkpoint and released from RAM.
+    """
     if not manifest: 
         return []
 
     # Group rows by image to run the vision encoder once
-    grouped_rows: dict[int, list[tuple[int, dict]]] = {}
-
-    for index, row in enumerate(manifest):
-        image_id = int(row['image_id'])
-
-        grouped_rows.setdefault(image_id, []).append(
-            (index, row)
-        )
-
-    ordered_results: list[InferenceResult | None] = [
-        None
-        for _ in manifest
-    ]
-
-    if checkpoint_dir is not None:
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    grouped_rows = _group_manifest(manifest)
+    ordered_results: list[InferenceResult | None] = [None] * len(manifest)
 
     for image_id, image_rows in grouped_rows.items():
-        # A resumed run need not load the image when all three questions already have valid checkpoint
-        missing_rows: list[tuple[int, dict]] = []
-
-        for original_index, row in image_rows:
-            if checkpoint_dir is None:
-                missing_rows.append((original_index, row))
-                continue
-
-            checkpoint = _checkpoint_path(checkpoint_dir, original_index, image_id)
-            cached_result = _load_checkpoint(checkpoint)
-
-            if cached_result is not None:
-                ordered_results[original_index] = cached_result
-                continue
-
-            missing_rows.append((original_index, row))
-
-        # Every question belonging to this image is already done.
-        if not missing_rows:
-            continue
-
-        # Load the image only if at least one question still needs work.
-        first_missing_row = missing_rows[0][1]
-
-        path = _image_path(image_dir, image_id, first_missing_row)
+        first_row = image_rows[0][1]
+        path = _image_path(image_dir, image_id, first_row)
 
         with Image.open(path) as opened_image:
             image = opened_image.convert('RGB')
@@ -551,22 +694,17 @@ def _run_manifest(model, processor, manifest: list[dict], image_dir: str, checkp
         # cache vision output ONCE for this image
         image_hidden_states = None
         if hasattr(model, 'get_image_features'):
-            first_question = str(first_missing_row['question'])
-
             first_inputs = _prepare_inputs(
                 model,
                 processor,
                 image,
-                first_question,
+                str(first_row['question']),
             )
-
             image_hidden_states = _extract_image_hidden_states(model, first_inputs)
-
-            # first_inputs is no longer required
             del first_inputs
 
         # Run unfinished questions.
-        for original_index, row in missing_rows:
+        for original_index, row in image_rows:
             result = _run_single_example_implementation(
                 model,
                 processor,
@@ -576,6 +714,76 @@ def _run_manifest(model, processor, manifest: list[dict], image_dir: str, checkp
             )
 
             # Add metadata that run_single_example cannot know
+            ordered_results[original_index] = replace(
+                result,
+                image_id=image_id,
+                category=str(row['category']),
+                question_type=str(row['question_type']),
+                ground_truth=_coerce_ground_truth(row['ground_truth']),
+            )
+
+        # The cached feature tensor is no longer needed after the three questions for this image
+        del image_hidden_states
+        del image
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if any(result is None for result in ordered_results):
+        raise RuntimeError('Inference failed to produce one result per manifest row.')
+
+    return [result for result in ordered_results if result is not None]
+
+def _run_manifest_resumable(model, processor, manifest: list[dict], image_dir: str, checkpoint_dir: Path) -> list[Path]:
+    """
+    Memory-safe full-run inference.
+
+    Each completed QA pair is atomically checkpointed and immediately released from RAM.
+    Existing structurally valid checkpoints are skipped on resumed runs.
+    """
+    if not manifest:
+        return []
+
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    grouped_rows = _group_manifest(manifest)
+    checkpoint_paths: list[Path | None] = [None] * len(manifest)
+
+    for image_id, image_rows in grouped_rows.items():
+        missing_rows: list[tuple[int, dict]] = []
+
+        for original_index, row in image_rows:
+            checkpoint = _checkpoint_path(checkpoint_dir, original_index, image_id)
+
+            if _checkpoint_is_valid(checkpoint, expected_manifest_index=original_index, expected_image_id=image_id):
+                checkpoint_paths[original_index] = checkpoint
+            else:
+                missing_rows.append((original_index, row))
+
+        if not missing_rows:
+            continue
+
+        first_missing_row = missing_rows[0][1]
+        path = _image_path(image_dir, image_id, first_missing_row)
+
+        with Image.opn(path) as opened_image:
+            image = opened_image.convert('RGB')
+
+        image_hidden_states = None
+
+        if hasattr(model, 'get_image_features'):
+            first_inputs = _prepare_inputs(model, processor, image, str(first_missing_row['question']))
+            image_hidden_states = _extract_image_hidden_states(model, first_inputs)
+            del first_inputs
+
+        for original_index, row in missing_rows:
+            result = _run_single_example_implementation(
+                model,
+                processor,
+                image,
+                str(row['question']),
+                image_hidden_states=image_hidden_states,
+            )
+
             result = replace(
                 result,
                 image_id=image_id,
@@ -584,38 +792,20 @@ def _run_manifest(model, processor, manifest: list[dict], image_dir: str, checkp
                 ground_truth=_coerce_ground_truth(row['ground_truth']),
             )
 
-            ordered_results[original_index] = result
+            checkpoint = _checkpoint_path(checkpoint_dir, original_index, image_id)
+            _save_checkpoint(result, checkpoint, original_index)
+            checkpoint_paths[original_index] = checkpoint
 
-            # Once this call returns successfully, this QA pair survives a later crash
-            if checkpoint_dir is not None:
-                checkpoint = _checkpoint_path(checkpoint_dir, original_index, image_id)
-                _save_checkpoint(result, checkpoint, original_index)
+            # Avoid retaining a 15+ GB result list in RAM
+            del result
 
-        # The cached feature tensor is no longer needed after the three questions for this image
         del image_hidden_states
+        del image
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    if any(path is None for path in checkpoint_paths):
+        raise RuntimeError('Inference failed to produce one checkpoint per manifest row.')
 
-    if any(result is None for result in ordered_results):
-        raise RuntimeError(
-            'Inference failed to produce one result per manifest row.'
-        )
-
-    return [
-        result
-        for result in ordered_results
-        if result is not None
-    ]
-
-# Additional resumable interface
-def run_inference_resumable(model, processor, manifest: list[dict], image_dir: str, checkpoint_dir: str) -> list[InferenceResult]:
-    """
-    Run inference with an atomic SafeTensors checkpoint after every QA pair.
-
-    Existing valid checkpoints are automatically loaded and skipped.
-    """
-    return _run_manifest(model, processor, manifest, image_dir, checkpoint_dir=Path(checkpoint_dir))
+    return [path for path in checkpoint_paths if path is not None]
 
 def load_model(model_name: str, device: str) -> tuple[PreTrainedModel, ProcessorMixin]:
     if device.startswith('cuda') and not torch.cuda.is_available():
@@ -623,9 +813,16 @@ def load_model(model_name: str, device: str) -> tuple[PreTrainedModel, Processor
 
     processor: ProcessorMixin = AutoProcessor.from_pretrained(model_name)
 
+    if device.startswith('cuda'):
+        model_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    elif device.startswith('mps'):
+        model_dtype = torch.float16
+    else:
+        model_dtype = torch.float32
+
     model: PreTrainedModel = _AutoModel.from_pretrained(
         model_name, 
-        torch_dtype=torch.bfloat16,
+        torch_dtype=model_dtype,
         attn_implementation='eager',
     ).to(device)
 
@@ -649,7 +846,18 @@ def run_inference_on_manifest(model, processor, manifest: list[dict], image_dir:
     Iterates the manifest, caching the vision-encoder pass per image_id rather than
     per question if your architecture allows it. Returns one InferenceResult per row.
     """
-    return _run_manifest(model, processor, manifest, image_dir, checkpoint_dir=None)
+    return _run_manifest_in_memory(model, processor, manifest, image_dir)
+
+def run_inference_resumable(model, processor, manifest: list[dict], image_dir: str, checkpoint_dir: str) -> list[Path]:
+    """
+    Run inference with one atomic SafeTensors checkpoint per QA pair.
+    Exisiting valid checkpoints are skipped. The returneed paths preserve manifest order.
+    """
+    return _run_manifest_resumable(model, processor, manifest, image_dir, checkpoint_dir=Path(checkpoint_dir))
+
+def iter_hidden_state_batches(checkpoint_dir: str | Path, max_batch_bytes: int = MAX_BATCH_BYTES):
+    """Public memory-bounded iterator over resumable checkpoint hidden states."""
+    yield from _iter_hidden_state_batches(checkpoint_dir, max_batch_bytes)
 
 def save_results(results: list[InferenceResult], path: str) -> None:
     """
@@ -665,6 +873,5 @@ def load_results(path: str) -> list[InferenceResult]:
     Load results previously written by save_results().
     """
     results, _ = _load_results_and_metadata(Path(path))
-
     return results
 
