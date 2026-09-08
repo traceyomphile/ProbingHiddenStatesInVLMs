@@ -840,8 +840,8 @@ def _run_manifest_resumable(model, processor, manifest: list[dict], image_dir: s
 
                 progress.update(1)
 
-        del image_hidden_states
-        del image
+            del image_hidden_states
+            del image
 
     if any(path is None for path in checkpoint_paths):
         raise RuntimeError('Inference failed to produce one checkpoint per manifest row.')
@@ -858,7 +858,7 @@ def load_checkpoint_metadata(checkpoint_paths: list[str | Path]) -> list[dict]:
             if 'result_0' not in metadata:
                 raise RuntimeError(f'Missing result_0 metadata in {path}')
 
-            results.append(json.load(metadata['result_0']))
+            results.append(json.loads(metadata['result_0']))
 
     return results
 

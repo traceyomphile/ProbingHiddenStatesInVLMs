@@ -10,18 +10,25 @@ from src.inference import load_model, run_inference_resumable, load_checkpoint_m
 
 def _get_unclear_rate(metadata_results: list[dict]) -> pd.DataFrame:
     strict_unclear_count, with_fallback_count, unresolveable = 0, 0, 0
+
     for item in metadata_results:
-        if item is None and item['parsed_result']['used_fallback'] == False:
+        used_fallback = item['parse_result']['used_fallback']
+        parsed_answer = item['parsed_answer']
+
+        if used_fallback:
             strict_unclear_count += 1
-            unresolveable += 1
-        if item is not None and item['parsed_result']['used_fallback'] == True:
-            strict_unclear_count += 1
-            with_fallback_count += 1
+
+            if parsed_answer is None:
+                unresolveable += 1
+            else:
+                with_fallback_count += 1
+
+    total = len(metadata_results)
     
     results = {
-        'strict_unclear_rate': (strict_unclear_count / len(metadata_results)),
-        'fallback_recovered_rate': (with_fallback_count / len(metadata_results)),
-        'truly_unresolved_rate': (unresolveable / len(metadata_results))
+        'strict_unclear_rate': (strict_unclear_count / total),
+        'fallback_recovered_rate': (with_fallback_count / total),
+        'truly_unresolved_rate': (unresolveable / total)
     }
 
     return pd.DataFrame(results.items(), columns=['rate_type', 'rate'])
@@ -29,12 +36,24 @@ def _get_unclear_rate(metadata_results: list[dict]) -> pd.DataFrame:
 def _get_accuracy(metadata_results: list[dict]) -> tuple[float, Counter]:
     total_correct = 0
     total_len = len(metadata_results)
-    qt_acc = Counter()
+
+    qt_correct = Counter()
+    qt_total = Counter()
 
     for item in metadata_results:
+        question_type = item['question_type']
+
+        qt_total[question_type] += 1
+
         if item['parsed_answer'] is not None and (item['parsed_answer'] == item['ground_truth']):
             total_correct += 1
-            qt_acc[item['question_type']] += 1
+            qt_correct[question_type] += 1
+
+    qt_acc = {
+        question_type: qt_correct[question_type] / count
+        for question_type, count in qt_total.items()
+    }
+
     return (total_correct / total_len), qt_acc
 
 if __name__ == '__main__':
