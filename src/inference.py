@@ -7,6 +7,7 @@ from tqdm import tqdm
 import numpy as np
 from pathlib import Path
 from PIL import Image
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from safetensors import safe_open
 from safetensors.torch import save_file
@@ -929,3 +930,7 @@ def load_results(path: str) -> list[InferenceResult]:
     results, _ = _load_results_and_metadata(Path(path))
     return results
 
+def iter_results(paths: list[str]) -> Iterator[InferenceResult]:
+    for path in paths:
+        results, _ = _load_results_and_metadata(Path(path))
+        yield from results
