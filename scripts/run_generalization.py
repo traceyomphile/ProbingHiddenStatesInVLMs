@@ -1,6 +1,5 @@
 # scripts.run_generalization.py
 
-import argparse
 import json 
 import logging
 import numpy as np
@@ -86,12 +85,14 @@ def _kept_metadata(metadata, row_ids: np.ndarray, manifest: list[dict]) -> list[
 
     return aligned
 
-def _write_audit(output_path: Path, metadata: list[dict], part_c_train_ids: set[int], d_train_indices: list[int], d_test_indices: list[int]) -> pd.DataFrame:
+def _write_audit(output_path: Path, metadata: list[dict], part_c_train_ids: set[int], part_c_val_ids: set[int], d_train_indices: list[int], d_test_indices: list[int]) -> pd.DataFrame:
     c_train_rows = {row['row_id'] for row in metadata if row['image_id'] in part_c_train_ids}
+    c_val_rows = {row['row_id'] for row in metadata if row['image_id'] in part_c_val_ids}
     d_train_rows = {metadata[index]['row_id'] for index in d_train_indices}
     d_test_rows = {metadata[index]['row_id'] for index in d_test_indices}
 
     audit = pd.DataFrame([
+        {'check': 'Part D train vs Part C held-out', 'overlap_count': len(d_train_rows  & c_val_rows)},
         {'check': 'Part D test vs Part C train', 'overlap_count': len(d_test_rows & c_train_rows)},
         {'check': 'Part D test vs Part D train', 'overlap_count': len(d_test_rows & d_train_rows)},
     ])
@@ -152,6 +153,7 @@ if __name__ == '__main__':
         output_dir / 'checkpoint_d_disjointness.csv',
         metadata,
         part_c_train_ids,
+        part_c_val_ids,
         d_train_indices,
         d_test_indices,
     )
@@ -221,6 +223,7 @@ if __name__ == '__main__':
     logging.info(f'Checkpoint D audit:\n%s\n', audit.to_string(index=False))
     logging.info(f'Q8 generationalisation gap:\n%s\n', q8.to_string(index=False))
     logging.info(f'Q8 disagreements: %d\n', len(disagreements))
+    logging.info(f'Q9 Disagreement examples:\n%s\n', q9.to_string(index=False))
 
     logging.info('Checkpoint D disjointness: PASS')
     logging.info(f'Best Part C layer {best_layer}')

@@ -27,15 +27,17 @@ def cross_category_split(results: list[InferenceResult | RowMeta], train_types: 
     train_indices: list[int] = []
     test_indices: list[int] = []
 
-    for idx in val_indices:
+    val_idx_set = {int(idx) for idx in val_indices}
+    for idx in val_idx_set:
         if not (0 <= idx < n_results):
             raise IndexError(f'val_indices contains {idx}, out of range for {n_results} result')
 
-        question_type = _field(results[idx], 'question_type')
+    for idx, result in enumerate(results):
+        question_type = _field(result, 'question_type')
 
-        if question_type in train_types_set:
+        if idx not in val_idx_set and question_type in train_types_set:
             train_indices.append(idx)
-        elif question_type in test_types_set:
+        elif idx in val_idx_set and question_type in test_types_set:
             test_indices.append(idx)
 
         # else: question_type wasn't requested for this experiment - excluded from both
