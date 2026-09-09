@@ -6,7 +6,7 @@ The project is based on the files currently present in this repo and reflects th
 
 ## Project purpose
 
-From the code structure and scripts, the project appears to do the following:
+The project does the following:
 
 - build a dataset manifest from COCO image annotations
 - sample image IDs and construct present/absent/adversarial questions
@@ -19,7 +19,7 @@ From the code structure and scripts, the project appears to do the following:
 
 ## Actual project structure
 
-This is the repository layout as it exists in the current workspace:
+This is the workspace layout structure:
 
 ```text
 ProbingHiddenStatesInVLMs/
